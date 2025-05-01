@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Location Image Search</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2rem; }
+    form { margin-bottom: 1.5rem; }
+    input[type=text] { width: 300px; padding: 0.5rem; }
+    input[type=submit] { padding: 0.5rem 1rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1rem; }
+    .grid img { width: 100%; height: auto; border-radius: 8px; object-fit: cover; }
+  </style>
+</head>
+<body>
+  <h1>Search Location Images</h1>
+  <form method="post">
+    <input type="text" name="location" placeholder="Enter a location..." value="{{ query }}" required>
+    <input type="submit" value="Search">
+  </form>
+
+  {% if images %}
+    <div class="grid">
+      {% for img in images %}
+        <a href="{{ img }}" target="_blank">
+          <img src="{{ img }}" alt="Image result">
+        </a>
+      {% endfor %}
+    </div>
+  {% elif query %}
+    <p>No images found for “<em>{{ query }}</em>.”</p>
+  {% endif %}
+</body>
+</html>
