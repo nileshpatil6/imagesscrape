@@ -24,7 +24,8 @@
     <div class="grid">
       {% for img in images %}
         <a href="{{ img }}" target="_blank">
-          <img src="{{ img }}" alt="Image result">
+       <img src="{{ img }}" loading="lazy" style="max-width: 100%; height: auto;" width="300">
+
         </a>
       {% endfor %}
     </div>
