@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 from duckduckgo_search import DDGS
 from concurrent.futures import ThreadPoolExecutor
@@ -43,12 +43,24 @@ def is_watermark_source(url: str) -> bool:
 
 def fetch_images(query: str):
     ddgs = DDGS()
-    results = ddgs.images(keywords=query, max_results=20)
+    results = ddgs.images(keywords=query, max_results=2)
     return [
         item["image"]
         for item in results
         if "image" in item and not is_watermark_source(item["image"])
     ]
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    query = ""
+    images = []
+
+    if request.method == "POST":
+        query = request.form.get("location", "").strip()
+        if query:
+            images = fetch_images(query)
+
+    return render_template("index.html", query=query, images=images)
 
 @app.route("/api/images", methods=["POST", "OPTIONS"])
 def get_images():
