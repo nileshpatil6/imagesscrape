@@ -1,32 +1,41 @@
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
-from duckduckgo_search import DDGS
 from concurrent.futures import ThreadPoolExecutor
+import requests
+import json
+from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
-# 1) Configure CORS for all /api/* endpoints
+# Enable CORS for all /api/* endpoints
 CORS(
     app,
-    resources={r"/api/*": {"origins": "*"}},  # allow any origin; lock this down in production!
+    resources={r"/api/*": {"origins": "*"}},
     supports_credentials=True,
 )
 
-# 2) Always add CORS headers, even on errors
+# Always add CORS headers to every response
 @app.after_request
 def add_cors_headers(response):
     response.headers.setdefault("Access-Control-Allow-Origin", "*")
     response.headers.setdefault(
-        "Access-Control-Allow-Headers",
-        "Content-Type,Authorization"
+        "Access-Control-Allow-Headers", "Content-Type,Authorization"
     )
     response.headers.setdefault(
-        "Access-Control-Allow-Methods",
-        "GET,POST,OPTIONS"
+        "Access-Control-Allow-Methods", "GET,POST,OPTIONS"
     )
     return response
 
-# Domains to exclude (watermark-heavy)
+# Fake browser headers
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/113.0.0.0 Safari/537.36"
+    )
+}
+
+# Watermark-heavy domains
 WATERMARK_DOMAINS = [
     "shutterstock.com",
     "alamy.com",
@@ -35,20 +44,37 @@ WATERMARK_DOMAINS = [
     "gettyimages.com",
     "123rf.com",
     "depositphotos.com",
-    "bigstockphoto.com"
+    "bigstockphoto.com",
 ]
 
 def is_watermark_source(url: str) -> bool:
     return any(domain in url for domain in WATERMARK_DOMAINS)
 
-def fetch_images(query: str):
-    ddgs = DDGS()
-    results = ddgs.images(keywords=query, max_results=2)
-    return [
-        item["image"]
-        for item in results
-        if "image" in item and not is_watermark_source(item["image"])
-    ]
+def fetch_images(query: str, max_images: int = 20):
+    """Scrape Bing Images and return valid URLs"""
+    params = {"q": query, "first": "0", "count": str(max_images)}
+    try:
+        resp = requests.get("https://www.bing.com/images/search", params=params, headers=HEADERS)
+        resp.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch from Bing: {e}")
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    image_elements = soup.find_all("a", class_="iusc")
+
+    urls = []
+    for elem in image_elements:
+        try:
+            m_json = json.loads(elem.get("m", "{}"))
+            url = m_json.get("murl")
+            if url and not is_watermark_source(url):
+                urls.append(url)
+        except Exception:
+            continue
+
+        if len(urls) >= max_images:
+            break
+    return urls
 
 @app.route("/", methods=["GET", "POST"])
 def index():
@@ -65,7 +91,6 @@ def index():
 @app.route("/api/images", methods=["POST", "OPTIONS"])
 def get_images():
     if request.method == "OPTIONS":
-        # Preflight request — return immediately
         return jsonify({}), 200
 
     data = request.get_json(force=True, silent=True) or {}
@@ -74,16 +99,12 @@ def get_images():
         return jsonify({"error": "Missing location"}), 400
 
     try:
-        # parallelize the fetch so Flask stays responsive
         with ThreadPoolExecutor() as executor:
             future = executor.submit(fetch_images, location)
             images = future.result()
         return jsonify({"images": images}), 200
-
     except Exception as e:
-        # even on errors, our after_request will attach CORS headers
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    # Enable threading so multiple requests are handled concurrently
     app.run(debug=True, threaded=True)
