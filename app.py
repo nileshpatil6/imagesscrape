@@ -8,15 +8,29 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-# Allow CORS from anywhere
+# More explicit CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=[
+        "https://www.triponbuddy.com",
+        "https://triponbuddy.com", 
+        "http://localhost:3000",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "*"  # Allow all origins for now
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"]
 )
 
-# In-memory cache & concurrency limiter
+# Add explicit OPTIONS handler for preflight requests
+@app.options("/api/bulk_images")
+async def options_bulk_images():
+    return {"message": "OK"}
+
+# Rest of your code remains the same...
 cache = TTLCache(maxsize=1000, ttl=3600)
 SEM = asyncio.Semaphore(50)
 
@@ -125,6 +139,11 @@ async def bulk_images(request: Union[List[str], Dict, LocationRequest]):
             detail="Invalid request format. Expected JSON array of strings or object with location property."
         )
 
+# Add a health check endpoint
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app_updated:app", host="0.0.0.0", port=8000, reload=True, workers=4)
+    uvicorn.run("app_updated:app", host="0.0.0.0", port=8000, reload=True, workers=1)
