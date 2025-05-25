@@ -1,3 +1,4 @@
+# app.py
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from cachetools import TTLCache, cached
@@ -8,15 +9,16 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-# Allow CORS from anywhere
+# ——— CORS — allow your frontend domain (or '*' for all)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://www.triponbuddy.com",],  # ← restrict to your domain in prod
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# In-memory cache & concurrency limiter
+# ——— Cache & concurrency limiter
 cache = TTLCache(maxsize=1000, ttl=3600)
 SEM = asyncio.Semaphore(50)
 
@@ -27,7 +29,6 @@ HEADERS = {
         "Chrome/113.0.0.0 Safari/537.36"
     )
 }
-
 WATERMARK_DOMAINS = {
     "shutterstock.com", "alamy.com", "istockphoto.com", "dreamstime.com",
     "gettyimages.com", "123rf.com", "depositphotos.com", "bigstockphoto.com"
@@ -47,10 +48,8 @@ async def fetch_images(query: str, max_images: int = 5) -> List[str]:
                 html = await resp.text()
 
     soup = BeautifulSoup(html, "html.parser")
-    elems = soup.select("a.iusc")
-    out = []
-
-    for e in elems:
+    out: List[str] = []
+    for e in soup.select("a.iusc"):
         try:
             data = json.loads(e.get("m", "{}"))
             img = data.get("murl")
@@ -64,64 +63,45 @@ async def fetch_images(query: str, max_images: int = 5) -> List[str]:
     return out
 
 class ImageParams(BaseModel):
-    aspectRatio: Optional[str] = None
-    minWidth: Optional[int] = None
-    minHeight: Optional[int] = None
-    preferredOrientation: Optional[str] = None
-    highQuality: Optional[bool] = None
+    aspectRatio: Optional[str]
+    minWidth: Optional[int]
+    minHeight: Optional[int]
+    preferredOrientation: Optional[str]
+    highQuality: Optional[bool]
 
 class LocationRequest(BaseModel):
     location: str
-    params: Optional[ImageParams] = None
+    params: Optional[ImageParams]
 
 @app.post("/api/bulk_images")
 async def bulk_images(request: Union[List[str], Dict, LocationRequest]):
-    """
-    Accepts:
-    1. JSON array of location strings: ["location1", "location2", ...]
-       Returns: { location1: [urls...], location2: [...] }
-
-    2. JSON object with location: { "location": "some_place", ... }
-       Returns: { "images": [urls...] }
-    """
-    # Case 1: List of strings
+    # 1️⃣ List of locations
     if isinstance(request, list):
         if not all(isinstance(loc, str) for loc in request):
             raise HTTPException(400, "All list items must be strings.")
-        
-        tasks = [fetch_images(loc, max_images=5) for loc in request]
+        tasks = [fetch_images(loc) for loc in request]
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        return {
+            loc: res if isinstance(res, list) else []
+            for loc, res in zip(request, results)
+        }
 
-        output: Dict[str, List[str]] = {}
-        for loc, res in zip(request, results):
-            output[loc] = res if isinstance(res, list) else []
-
-        return output
-
-    # Case 2: Dict with 'location'
-    elif isinstance(request, dict) and "location" in request:
-        location = request.get("location")
+    # 2️⃣ Dict with `location`
+    if isinstance(request, dict) and "location" in request:
+        loc = request["location"]
         try:
-            images = await fetch_images(location, max_images=5)
-            return {"images": images}
+            imgs = await fetch_images(loc)
         except Exception:
-            return {"images": []}
+            imgs = []
+        return {"images": imgs}
 
-    # Case 3: Proper Pydantic model
-    elif isinstance(request, LocationRequest):
+    # 3️⃣ Pydantic model
+    if isinstance(request, LocationRequest):
         try:
-            images = await fetch_images(request.location, max_images=5)
-            return {"images": images}
+            imgs = await fetch_images(request.location)
         except Exception:
-            return {"images": []}
+            imgs = []
+        return {"images": imgs}
 
-    # Invalid request
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid request format. Expected JSON array or object with 'location'."
-        )
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app_updated:app", host="0.0.0.0", port=8000, reload=True, workers=4)
+    # ❌ Otherwise
+    raise HTTPException(400, "Invalid request format.")
