@@ -1,32 +1,25 @@
-from flask import Flask, request, jsonify, render_template
-from flask_cors import CORS
-from concurrent.futures import ThreadPoolExecutor
-import requests
-import json
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from cachetools import TTLCache, cached
+import aiohttp, asyncio, json
 from bs4 import BeautifulSoup
+from typing import List, Dict, Union, Optional
+from pydantic import BaseModel
 
-app = Flask(__name__)
+app = FastAPI()
 
-# Enable CORS for all /api/* endpoints
-CORS(
-    app,
-    resources={r"/api/*": {"origins": "*"}},
-    supports_credentials=True,
+# Allow CORS from anywhere
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Always add CORS headers to every response
-@app.after_request
-def add_cors_headers(response):
-    response.headers.setdefault("Access-Control-Allow-Origin", "*")
-    response.headers.setdefault(
-        "Access-Control-Allow-Headers", "Content-Type,Authorization"
-    )
-    response.headers.setdefault(
-        "Access-Control-Allow-Methods", "GET,POST,OPTIONS"
-    )
-    return response
+# In-memory cache & concurrency limiter
+cache = TTLCache(maxsize=1000, ttl=3600)
+SEM = asyncio.Semaphore(50)
 
-# Fake browser headers
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -34,77 +27,104 @@ HEADERS = {
         "Chrome/113.0.0.0 Safari/537.36"
     )
 }
-
-# Watermark-heavy domains
-WATERMARK_DOMAINS = [
-    "shutterstock.com",
-    "alamy.com",
-    "istockphoto.com",
-    "dreamstime.com",
-    "gettyimages.com",
-    "123rf.com",
-    "depositphotos.com",
-    "bigstockphoto.com",
-]
+WATERMARK_DOMAINS = {
+    "shutterstock.com","alamy.com","istockphoto.com","dreamstime.com",
+    "gettyimages.com","123rf.com","depositphotos.com","bigstockphoto.com"
+}
 
 def is_watermark_source(url: str) -> bool:
-    return any(domain in url for domain in WATERMARK_DOMAINS)
+    return any(d in url for d in WATERMARK_DOMAINS)
 
-def fetch_images(query: str, max_images: int = 20):
-    """Scrape Bing Images and return valid URLs"""
-    params = {"q": query, "first": "0", "count": str(max_images)}
-    try:
-        resp = requests.get("https://www.bing.com/images/search", params=params, headers=HEADERS)
-        resp.raise_for_status()
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch from Bing: {e}")
+@cached(cache)
+async def fetch_images(query: str, max_images: int = 5) -> List[str]:
+    async with SEM:
+        url = f"https://www.bing.com/images/search?q={query}&count={max_images}"
+        async with aiohttp.ClientSession(headers=HEADERS) as sess:
+            async with sess.get(url) as resp:
+                if resp.status != 200:
+                    raise HTTPException(502, f"Bing returned {resp.status}")
+                html = await resp.text()
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    image_elements = soup.find_all("a", class_="iusc")
-
-    urls = []
-    for elem in image_elements:
+    soup = BeautifulSoup(html, "html.parser")
+    elems = soup.select("a.iusc")
+    out = []
+    for e in elems:
         try:
-            m_json = json.loads(elem.get("m", "{}"))
-            url = m_json.get("murl")
-            if url and not is_watermark_source(url):
-                urls.append(url)
-        except Exception:
-            continue
-
-        if len(urls) >= max_images:
+            data = json.loads(e.get("m", "{}"))
+            img = data.get("murl")
+            if img and not is_watermark_source(img):
+                out.append(img)
+        except:
+            pass
+        if len(out) >= max_images:
             break
-    return urls
+    return out
 
-@app.route("/", methods=["GET", "POST"])
-def index():
-    query = ""
-    images = []
+class ImageParams(BaseModel):
+    aspectRatio: Optional[str] = None
+    minWidth: Optional[int] = None
+    minHeight: Optional[int] = None
+    preferredOrientation: Optional[str] = None
+    highQuality: Optional[bool] = None
 
-    if request.method == "POST":
-        query = request.form.get("location", "").strip()
-        if query:
-            images = fetch_images(query)
+class LocationRequest(BaseModel):
+    location: str
+    params: Optional[ImageParams] = None
 
-    return render_template("index.html", query=query, images=images)
+@app.post("/api/bulk_images")
+async def bulk_images(request: Union[List[str], Dict, LocationRequest]):
+    """
+    Accepts two formats:
+    1. JSON array of location strings: ["location1", "location2", ...]
+       Returns: { location1: [urls...], location2: [...] }
+    
+    2. JSON object with location property: { "location": "location1", ... }
+       Returns: { "images": [urls...] }
+    """
+    # Handle array of strings (original format)
+    if isinstance(request, list):
+        if not all(isinstance(loc, str) for loc in request):
+            raise HTTPException(400, "When sending an array, all items must be strings.")
+        
+        # Kick off all scrapes in parallel
+        tasks = [fetch_images(loc, max_images=5) for loc in request]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-@app.route("/api/images", methods=["POST", "OPTIONS"])
-def get_images():
-    if request.method == "OPTIONS":
-        return jsonify({}), 200
+        output: Dict[str, List[str]] = {}
+        for loc, res in zip(request, results):
+            if isinstance(res, Exception):
+                output[loc] = []
+            else:
+                output[loc] = res
 
-    data = request.get_json(force=True, silent=True) or {}
-    location = data.get("location", "").strip()
-    if not location:
-        return jsonify({"error": "Missing location"}), 400
-
-    try:
-        with ThreadPoolExecutor() as executor:
-            future = executor.submit(fetch_images, location)
-            images = future.result()
-        return jsonify({"images": images}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return output
+    
+    # Handle object with location property (for backward compatibility)
+    elif isinstance(request, dict) and "location" in request:
+        location = request["location"]
+        # Params are ignored in current implementation but could be used in future
+        
+        try:
+            images = await fetch_images(location, max_images=5)
+            return {"images": images}
+        except Exception as e:
+            return {"images": []}
+    
+    # Handle Pydantic model (for type safety)
+    elif isinstance(request, LocationRequest):
+        try:
+            images = await fetch_images(request.location, max_images=5)
+            return {"images": images}
+        except Exception as e:
+            return {"images": []}
+    
+    # Invalid request format
+    else:
+        raise HTTPException(
+            status_code=400, 
+            detail="Invalid request format. Expected JSON array of strings or object with location property."
+        )
 
 if __name__ == "__main__":
-    app.run(debug=True, threaded=True)
+    import uvicorn
+    uvicorn.run("app_updated:app", host="0.0.0.0", port=8000, reload=True, workers=4)
