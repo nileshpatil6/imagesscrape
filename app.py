@@ -8,27 +8,14 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-# More explicit CORS configuration
+# Simplified CORS configuration that works better with Gunicorn
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://www.triponbuddy.com",
-        "https://triponbuddy.com", 
-        "http://localhost:3000",
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-        "*"  # Allow all origins for now
-    ],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
-    expose_headers=["*"]
 )
-
-# Add explicit OPTIONS handler for preflight requests
-@app.options("/api/bulk_images")
-async def options_bulk_images():
-    return {"message": "OK"}
 
 # Rest of your code remains the same...
 cache = TTLCache(maxsize=1000, ttl=3600)
@@ -85,6 +72,14 @@ class LocationRequest(BaseModel):
     location: str
     params: Optional[ImageParams] = None
 
+@app.get("/")
+async def root():
+    return {"message": "Image Scraper API is running"}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
 @app.post("/api/bulk_images")
 async def bulk_images(request: Union[List[str], Dict, LocationRequest]):
     """
@@ -95,55 +90,52 @@ async def bulk_images(request: Union[List[str], Dict, LocationRequest]):
     2. JSON object with location property: { "location": "location1", ... }
        Returns: { "images": [urls...] }
     """
-    # Handle array of strings (original format)
-    if isinstance(request, list):
-        if not all(isinstance(loc, str) for loc in request):
-            raise HTTPException(400, "When sending an array, all items must be strings.")
+    try:
+        # Handle array of strings (original format)
+        if isinstance(request, list):
+            if not all(isinstance(loc, str) for loc in request):
+                raise HTTPException(400, "When sending an array, all items must be strings.")
+            
+            # Kick off all scrapes in parallel
+            tasks = [fetch_images(loc, max_images=5) for loc in request]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            output: Dict[str, List[str]] = {}
+            for loc, res in zip(request, results):
+                if isinstance(res, Exception):
+                    output[loc] = []
+                else:
+                    output[loc] = res
+
+            return output
         
-        # Kick off all scrapes in parallel
-        tasks = [fetch_images(loc, max_images=5) for loc in request]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        output: Dict[str, List[str]] = {}
-        for loc, res in zip(request, results):
-            if isinstance(res, Exception):
-                output[loc] = []
-            else:
-                output[loc] = res
-
-        return output
-    
-    # Handle object with location property (for backward compatibility)
-    elif isinstance(request, dict) and "location" in request:
-        location = request["location"]
-        # Params are ignored in current implementation but could be used in future
+        # Handle object with location property (for backward compatibility)
+        elif isinstance(request, dict) and "location" in request:
+            location = request["location"]
+            
+            try:
+                images = await fetch_images(location, max_images=5)
+                return {"images": images}
+            except Exception as e:
+                return {"images": []}
         
-        try:
-            images = await fetch_images(location, max_images=5)
-            return {"images": images}
-        except Exception as e:
-            return {"images": []}
-    
-    # Handle Pydantic model (for type safety)
-    elif isinstance(request, LocationRequest):
-        try:
-            images = await fetch_images(request.location, max_images=5)
-            return {"images": images}
-        except Exception as e:
-            return {"images": []}
-    
-    # Invalid request format
-    else:
-        raise HTTPException(
-            status_code=400, 
-            detail="Invalid request format. Expected JSON array of strings or object with location property."
-        )
-
-# Add a health check endpoint
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy"}
+        # Handle Pydantic model (for type safety)
+        elif isinstance(request, LocationRequest):
+            try:
+                images = await fetch_images(request.location, max_images=5)
+                return {"images": images}
+            except Exception as e:
+                return {"images": []}
+        
+        # Invalid request format
+        else:
+            raise HTTPException(
+                status_code=400, 
+                detail="Invalid request format. Expected JSON array of strings or object with location property."
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app_updated:app", host="0.0.0.0", port=8000, reload=True, workers=1)
+    uvicorn.run("app_updated:app", host="0.0.0.0", port=8000, reload=True)
