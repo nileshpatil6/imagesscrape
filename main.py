@@ -1,9 +1,14 @@
+import os
+import json
+import asyncio
+from typing import List, Optional
+
+import aiohttp
+from bs4 import BeautifulSoup
+from cachetools import TTLCache, cached
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from cachetools import TTLCache, cached
-import aiohttp, asyncio, json
-from bs4 import BeautifulSoup
-from typing import List, Dict, Optional, Union
 from pydantic import BaseModel
 
 app = FastAPI()
@@ -11,7 +16,7 @@ app = FastAPI()
 # CORS setup
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],         # or ["http://localhost:4173"] for tighter security
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -34,28 +39,28 @@ WATERMARK_DOMAINS = {
 }
 
 def is_watermark_source(url: str) -> bool:
-    return any(d in url for d in WATERMARK_DOMAINS)
+    return any(domain in url for domain in WATERMARK_DOMAINS)
 
 @cached(cache)
 async def fetch_images(query: str, max_images: int = 5) -> List[str]:
     async with SEM:
-        url = f"https://www.bing.com/images/search?q={query}&count={max_images}"
+        bing_url = f"https://www.bing.com/images/search?q={query}&count={max_images}"
         async with aiohttp.ClientSession(headers=HEADERS) as sess:
-            async with sess.get(url) as resp:
+            async with sess.get(bing_url) as resp:
                 if resp.status != 200:
                     raise HTTPException(502, f"Bing returned status {resp.status}")
                 html = await resp.text()
 
     soup = BeautifulSoup(html, "html.parser")
     elems = soup.select("a.iusc")
-    out = []
+    out: List[str] = []
     for e in elems:
         try:
             data = json.loads(e.get("m", "{}"))
             img = data.get("murl")
             if img and not is_watermark_source(img):
                 out.append(img)
-        except:
+        except json.JSONDecodeError:
             continue
         if len(out) >= max_images:
             break
@@ -77,9 +82,9 @@ async def bulk_images(req: Request):
     try:
         data = await req.json()
     except Exception:
-        raise HTTPException(400, "Request body must be JSON")
+        raise HTTPException(400, "Request body must be valid JSON")
 
-    # Format 1: List of locations
+    # Format 1: list of location strings
     if isinstance(data, list):
         if not all(isinstance(item, str) for item in data):
             raise HTTPException(400, "All items in the list must be strings.")
@@ -90,20 +95,27 @@ async def bulk_images(req: Request):
             for loc, res in zip(data, results)
         }
 
-    # Format 2 & 3: Object with location field
-    elif isinstance(data, dict) and "location" in data:
+    # Format 2: single object with 'location'
+    if isinstance(data, dict) and "location" in data:
         location = data["location"]
         if not isinstance(location, str):
             raise HTTPException(400, "The 'location' field must be a string.")
         try:
             images = await fetch_images(location, max_images=5)
             return {"images": images}
-        except:
+        except Exception:
             return {"images": []}
 
     raise HTTPException(400, "Invalid request format. Expected list or object with 'location'.")
 
-# To run locally with: `python app.py`
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+
+    # Use the PORT environment variable that Cloud Run (or other hosts) sets
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=port,
+        reload=True
+    )
