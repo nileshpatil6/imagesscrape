@@ -13,15 +13,15 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-# CORS setup
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],         # or ["http://localhost:4173"] for tighter security
+    allow_origins=["*"],        # or ["http://localhost:4173"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Concurrency and cache
+# cache & concurrency
 cache = TTLCache(maxsize=1000, ttl=3600)
 SEM = asyncio.Semaphore(50)
 
@@ -39,7 +39,7 @@ WATERMARK_DOMAINS = {
 }
 
 def is_watermark_source(url: str) -> bool:
-    return any(domain in url for domain in WATERMARK_DOMAINS)
+    return any(d in url for d in WATERMARK_DOMAINS)
 
 @cached(cache)
 async def fetch_images(query: str, max_images: int = 5) -> List[str]:
@@ -48,13 +48,12 @@ async def fetch_images(query: str, max_images: int = 5) -> List[str]:
         async with aiohttp.ClientSession(headers=HEADERS) as sess:
             async with sess.get(bing_url) as resp:
                 if resp.status != 200:
-                    raise HTTPException(502, f"Bing returned status {resp.status}")
+                    raise HTTPException(502, f"Bing returned {resp.status}")
                 html = await resp.text()
 
     soup = BeautifulSoup(html, "html.parser")
-    elems = soup.select("a.iusc")
     out: List[str] = []
-    for e in elems:
+    for e in soup.select("a.iusc"):
         try:
             data = json.loads(e.get("m", "{}"))
             img = data.get("murl")
@@ -73,49 +72,32 @@ class ImageParams(BaseModel):
     preferredOrientation: Optional[str] = None
     highQuality: Optional[bool] = None
 
-class LocationRequest(BaseModel):
-    location: str
-    params: Optional[ImageParams] = None
-
 @app.post("/api/bulk_images")
 async def bulk_images(req: Request):
     try:
         data = await req.json()
     except Exception:
-        raise HTTPException(400, "Request body must be valid JSON")
+        raise HTTPException(400, "Invalid JSON body")
 
-    # Format 1: list of location strings
     if isinstance(data, list):
         if not all(isinstance(item, str) for item in data):
-            raise HTTPException(400, "All items in the list must be strings.")
-        tasks = [fetch_images(loc, max_images=5) for loc in data]
+            raise HTTPException(400, "List items must be strings")
+        tasks = [fetch_images(loc) for loc in data]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        return {
-            loc: res if isinstance(res, list) else []
-            for loc, res in zip(data, results)
-        }
+        return {loc: (res if isinstance(res, list) else []) for loc, res in zip(data, results)}
 
-    # Format 2: single object with 'location'
     if isinstance(data, dict) and "location" in data:
-        location = data["location"]
-        if not isinstance(location, str):
-            raise HTTPException(400, "The 'location' field must be a string.")
+        loc = data["location"]
+        if not isinstance(loc, str):
+            raise HTTPException(400, "`location` must be a string")
         try:
-            images = await fetch_images(location, max_images=5)
-            return {"images": images}
-        except Exception:
+            return {"images": await fetch_images(loc)}
+        except:
             return {"images": []}
 
-    raise HTTPException(400, "Invalid request format. Expected list or object with 'location'.")
+    raise HTTPException(400, "Expected list or object with 'location'")
 
 if __name__ == "__main__":
     import uvicorn
-
-    # Use the PORT environment variable that Cloud Run (or other hosts) sets
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(
-        "app:app",
-        host="0.0.0.0",
-        port=port,
-        reload=True
-    )
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
